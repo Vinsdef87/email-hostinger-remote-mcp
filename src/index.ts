@@ -54,7 +54,7 @@ function newImapClient(): ImapFlow {
     port: IMAP_PORT,
     secure: IMAP_SECURE,
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-    logger: process.env.IMAP_DEBUG === "1" || true
+    logger: process.env.IMAP_DEBUG === "1"
       ? ({ debug: (o: any) => console.log("[imap]", JSON.stringify(o).slice(0, 400)), info: () => {}, warn: (o: any) => console.warn("[imap]", JSON.stringify(o).slice(0, 400)), error: (o: any) => console.error("[imap]", JSON.stringify(o).slice(0, 400)) } as any)
       : false,
     connectionTimeout: IMAP_CONNECTION_TIMEOUT,
@@ -161,9 +161,12 @@ function createServer(): McpServer {
         const limit = top ?? 10;
 
         if (uids) {
-          // fetch specific uids, newest first
-          const sliced = uids.slice(-limit).reverse();
-          for await (const msg of client.fetch(sliced, { uid: true, envelope: true, flags: true, bodyStructure: true, source: false }, { uid: true })) {
+          // Fetch the newest `limit` uids. IMPORTANT: keep the UID list in
+          // ASCENDING order — Hostinger's Dovecot never answers a UID FETCH whose
+          // set is descending (e.g. "13364,13363,13362") → socket timeout.
+          // Results are reversed afterwards so the newest comes first.
+          const sliced = uids.slice(-limit).sort((a, b) => a - b);
+          for await (const msg of client.fetch(sliced, { uid: true, envelope: true, flags: true, source: false }, { uid: true })) {
             // fetch a preview
             let preview = "";
             try {
@@ -184,6 +187,7 @@ function createServer(): McpServer {
               bodyPreview: preview.replace(/\s+/g, " ").trim().slice(0, 150),
             });
           }
+          results.reverse(); // newest first
         } else {
           // walk from newest: use sequence range
           const status = await client.status(mailbox, { messages: true });
@@ -468,7 +472,7 @@ function createServer(): McpServer {
         }
         const uids = await client.search(criteria, { uid: true });
         const limit = top ?? 10;
-        const sliced = (uids || []).slice(-limit).reverse();
+        const sliced = (uids || []).slice(-limit).sort((a, b) => a - b); // ascending: see note in email_list_messages
         const results: any[] = [];
         if (sliced.length > 0) {
           for await (const msg of client.fetch(sliced, { uid: true, envelope: true, flags: true }, { uid: true })) {
@@ -481,6 +485,7 @@ function createServer(): McpServer {
             });
           }
         }
+        results.reverse(); // newest first
         return { folder: mailbox, query: q, count: results.length, messages: results };
       } finally {
         lock.release();
@@ -509,7 +514,7 @@ app.use((req: Request, res: Response, next) => {
 });
 
 app.get("/health", (_req: Request, res: Response) => {
-  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.2", mailbox: EMAIL_USER });
+  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.3", mailbox: EMAIL_USER });
 });
 
 // Diagnostic endpoint (bearer-protected): egress IP, DNS, raw TCP/TLS probe to IMAP/SMTP hosts.
@@ -587,6 +592,7 @@ app.get("/debug/imap", async (req: Request, res: Response) => {
   if (last.length) {
     await timed("fetch envelope+flags", async () => { const out: any[] = []; for await (const m of client.fetch(last, { uid: true, envelope: true, flags: true }, { uid: true })) out.push(m.envelope?.subject); return out; });
     await timed("fetch +bodyStructure", async () => { const out: any[] = []; for await (const m of client.fetch(last, { uid: true, envelope: true, flags: true, bodyStructure: true }, { uid: true })) out.push(m.uid); return out; });
+    await timed("fetch DESCENDING no bodyStructure", async () => { const out: any[] = []; for await (const m of client.fetch([...last].reverse(), { uid: true, envelope: true, flags: true }, { uid: true })) out.push(m.uid); return out; }, 15000);
     await timed("download 1024B", async () => { const d = await client.download(String(last[last.length - 1]), undefined, { uid: true, maxBytes: 1024 }); let n = 0; if (d?.content) for await (const c of d.content) n += (c as Buffer).length; return { bytes: n }; });
   }
   await timed("search unseen FULL", async () => { const r = await client.search({ seen: false }, { uid: true }); return { count: (r || []).length }; }, 20000);
@@ -616,5 +622,5 @@ process.on("unhandledRejection", (reason) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Email Hostinger MCP server v1.0.2 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
+  console.log(`Email Hostinger MCP server v1.0.3 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
 });
