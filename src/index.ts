@@ -553,6 +553,45 @@ app.get("/debug/net", async (req: Request, res: Response) => {
   res.json(out);
 });
 
+// Diagnostic: step-by-step IMAP timings (bearer-protected)
+app.get("/debug/imap", async (req: Request, res: Response) => {
+  const auth = req.headers.authorization || "";
+  if (!API_SECRET || auth !== `Bearer ${API_SECRET}`) { res.status(401).json({ error: "unauthorized" }); return; }
+  const steps: any[] = [];
+  const timed = async (name: string, fn: () => Promise<any>, guardMs = 25000) => {
+    const t0 = Date.now();
+    try {
+      const r = await Promise.race([fn(), new Promise((_, rej) => setTimeout(() => rej(new Error("guard timeout")), guardMs))]);
+      steps.push({ name, ms: Date.now() - t0, ok: true, result: r });
+      return r;
+    } catch (e: any) {
+      steps.push({ name, ms: Date.now() - t0, ok: false, error: e?.code || e?.message });
+      return undefined;
+    }
+  };
+  const client = new ImapFlow({
+    host: IMAP_HOST, port: IMAP_PORT, secure: IMAP_SECURE,
+    auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+    logger: { debug: (o: any) => console.log("[imapdbg]", JSON.stringify(o).slice(0, 300)), info: () => {}, warn: (o: any) => console.warn("[imapdbg]", JSON.stringify(o).slice(0, 300)), error: (o: any) => console.error("[imapdbg]", JSON.stringify(o).slice(0, 300)) } as any,
+    connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 30000,
+  });
+  client.on("error", (e: Error) => steps.push({ event: "error", error: (e as any)?.code || e?.message }));
+  await timed("connect", () => client.connect());
+  const mb: any = await timed("mailboxOpen INBOX", async () => { const m: any = await client.mailboxOpen("INBOX"); return { exists: m.exists, uidNext: m.uidNext, uidValidity: String(m.uidValidity) }; });
+  const uidNext = mb?.uidNext || 0;
+  const w = Math.max(1, uidNext - 200);
+  const u1: any = await timed(`search unseen uid ${w}:*`, async () => { const r = await client.search({ seen: false, uid: `${w}:*` }, { uid: true }); return { count: (r || []).length, last: (r || []).slice(-3) }; });
+  const last = (u1?.last || []) as number[];
+  if (last.length) {
+    await timed("fetch envelope+flags", async () => { const out: any[] = []; for await (const m of client.fetch(last, { uid: true, envelope: true, flags: true }, { uid: true })) out.push(m.envelope?.subject); return out; });
+    await timed("fetch +bodyStructure", async () => { const out: any[] = []; for await (const m of client.fetch(last, { uid: true, envelope: true, flags: true, bodyStructure: true }, { uid: true })) out.push(m.uid); return out; });
+    await timed("download 1024B", async () => { const d = await client.download(String(last[last.length - 1]), undefined, { uid: true, maxBytes: 1024 }); let n = 0; if (d?.content) for await (const c of d.content) n += (c as Buffer).length; return { bytes: n }; });
+  }
+  await timed("search unseen FULL", async () => { const r = await client.search({ seen: false }, { uid: true }); return { count: (r || []).length }; }, 20000);
+  try { await client.logout(); } catch { try { client.close(); } catch { /* ignore */ } }
+  res.json({ steps });
+});
+
 app.all("/mcp", async (req: Request, res: Response) => {
   try {
     const server = createServer();
