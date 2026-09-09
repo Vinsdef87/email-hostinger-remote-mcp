@@ -493,6 +493,49 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.1", mailbox: EMAIL_USER });
 });
 
+// Diagnostic endpoint (bearer-protected): egress IP, DNS, raw TCP/TLS probe to IMAP/SMTP hosts.
+app.get("/debug/net", async (req: Request, res: Response) => {
+  const auth = req.headers.authorization || "";
+  if (!API_SECRET || auth !== `Bearer ${API_SECRET}`) { res.status(401).json({ error: "unauthorized" }); return; }
+  const dns = await import("node:dns/promises");
+  const tls = await import("node:tls");
+  const net = await import("node:net");
+  const out: any = { node: process.version, imapHost: IMAP_HOST, imapPort: IMAP_PORT };
+  try {
+    const r = await fetch("https://api.ipify.org?format=json", { signal: AbortSignal.timeout(8000) });
+    out.egressIp = (await r.json() as any).ip;
+  } catch (e: any) { out.egressIp = `error: ${e?.message}`; }
+  try {
+    const r6 = await fetch("https://api64.ipify.org?format=json", { signal: AbortSignal.timeout(8000) });
+    out.egressIp64 = (await r6.json() as any).ip;
+  } catch (e: any) { out.egressIp64 = `error: ${e?.message}`; }
+  const probe = (host: string, port: number, family: 4 | 6, useTls: boolean) => new Promise<any>((resolve) => {
+    const t0 = Date.now();
+    const done = (r: any) => resolve({ host, port, family, tls: useTls, ms: Date.now() - t0, ...r });
+    const opts: any = { host, port, family, timeout: 10000 };
+    const sock = useTls
+      ? tls.connect({ ...opts, servername: host, rejectUnauthorized: false })
+      : net.connect(opts);
+    let greeting = "";
+    sock.setTimeout(10000);
+    sock.on(useTls ? "secureConnect" : "connect", () => { /* wait for greeting */ });
+    sock.on("data", (d: Buffer) => { greeting += d.toString("utf8"); if (greeting.includes("\n")) { sock.destroy(); done({ ok: true, greeting: greeting.trim().slice(0, 120) }); } });
+    sock.on("timeout", () => { sock.destroy(); done({ ok: false, error: "timeout", greeting: greeting.slice(0, 120) }); });
+    sock.on("error", (e: any) => { done({ ok: false, error: e?.code || e?.message }); });
+  });
+  for (const h of [IMAP_HOST, SMTP_HOST]) {
+    try { out[`dns_${h}`] = await dns.lookup(h, { all: true }); } catch (e: any) { out[`dns_${h}`] = `error: ${e?.code}`; }
+  }
+  out.probes = await Promise.all([
+    probe(IMAP_HOST, IMAP_PORT, 4, true),
+    probe(IMAP_HOST, IMAP_PORT, 6, true),
+    probe(IMAP_HOST, 143, 4, false),
+    probe(SMTP_HOST, SMTP_PORT, 4, true),
+    probe(SMTP_HOST, 587, 4, false),
+  ]);
+  res.json(out);
+});
+
 app.all("/mcp", async (req: Request, res: Response) => {
   try {
     const server = createServer();
