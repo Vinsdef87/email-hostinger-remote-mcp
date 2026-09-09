@@ -166,8 +166,15 @@ function createServer(): McpServer {
           // set is descending (e.g. "13364,13363,13362") → socket timeout.
           // Results are reversed afterwards so the newest comes first.
           const sliced = uids.slice(-limit).sort((a, b) => a - b);
-          for await (const msg of client.fetch(sliced, { uid: true, envelope: true, flags: true, source: false }, { uid: true })) {
-            // fetch a preview
+          // 1) collect all rows first. NEVER run another IMAP command (e.g. download)
+          //    while iterating client.fetch(): imapflow >= 1.7 deadlocks → socket timeout.
+          const rows: any[] = [];
+          for await (const msg of client.fetch(sliced, { uid: true, envelope: true, flags: true }, { uid: true })) {
+            rows.push(msg);
+          }
+          rows.reverse(); // newest first
+          // 2) then fetch previews one by one
+          for (const msg of rows) {
             let preview = "";
             try {
               const d = await client.download(String(msg.uid), undefined, { uid: true, maxBytes: 1024 });
@@ -187,7 +194,6 @@ function createServer(): McpServer {
               bodyPreview: preview.replace(/\s+/g, " ").trim().slice(0, 150),
             });
           }
-          results.reverse(); // newest first
         } else {
           // walk from newest: use sequence range
           const status = await client.status(mailbox, { messages: true });
@@ -514,7 +520,7 @@ app.use((req: Request, res: Response, next) => {
 });
 
 app.get("/health", (_req: Request, res: Response) => {
-  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.3", mailbox: EMAIL_USER });
+  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.4", mailbox: EMAIL_USER });
 });
 
 // Diagnostic endpoint (bearer-protected): egress IP, DNS, raw TCP/TLS probe to IMAP/SMTP hosts.
@@ -622,5 +628,5 @@ process.on("unhandledRejection", (reason) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Email Hostinger MCP server v1.0.3 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
+  console.log(`Email Hostinger MCP server v1.0.4 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
 });
