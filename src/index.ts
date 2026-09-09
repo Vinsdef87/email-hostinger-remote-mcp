@@ -54,7 +54,9 @@ function newImapClient(): ImapFlow {
     port: IMAP_PORT,
     secure: IMAP_SECURE,
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-    logger: false,
+    logger: process.env.IMAP_DEBUG === "1" || true
+      ? ({ debug: (o: any) => console.log("[imap]", JSON.stringify(o).slice(0, 400)), info: () => {}, warn: (o: any) => console.warn("[imap]", JSON.stringify(o).slice(0, 400)), error: (o: any) => console.error("[imap]", JSON.stringify(o).slice(0, 400)) } as any)
+      : false,
     connectionTimeout: IMAP_CONNECTION_TIMEOUT,
     greetingTimeout: IMAP_GREETING_TIMEOUT,
     socketTimeout: IMAP_SOCKET_TIMEOUT,
