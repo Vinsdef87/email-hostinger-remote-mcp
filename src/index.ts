@@ -134,9 +134,26 @@ function createServer(): McpServer {
         const searchCriteria: Record<string, unknown> = {};
         if (unreadOnly) searchCriteria.seen = false;
         if (search) searchCriteria.body = search;
-        const uids = Object.keys(searchCriteria).length > 0
-          ? await client.search(searchCriteria, { uid: true })
-          : null;
+        let uids: number[] | null = null;
+        if (search) {
+          // full-text search: has to scan the whole mailbox
+          uids = (await client.search(searchCriteria, { uid: true })) || [];
+        } else if (unreadOnly) {
+          // UNSEEN over the whole mailbox is very slow on Hostinger for big
+          // mailboxes (> 60s → socket timeout). Search a recent UID window and
+          // widen it only if we did not find enough messages.
+          const limitWanted = top ?? 10;
+          const uidNext = (client.mailbox && typeof client.mailbox === "object" && (client.mailbox as any).uidNext) || 0;
+          let window = Math.max(limitWanted * 20, 200);
+          uids = [];
+          for (let i = 0; i < 4; i++) {
+            const fromUid = uidNext ? Math.max(1, uidNext - window) : 1;
+            const found = (await client.search({ ...searchCriteria, uid: `${fromUid}:*` }, { uid: true })) || [];
+            uids = found;
+            if (found.length >= limitWanted || fromUid === 1 || !uidNext) break;
+            window *= 4;
+          }
+        }
 
         const results: any[] = [];
         const limit = top ?? 10;
@@ -490,7 +507,7 @@ app.use((req: Request, res: Response, next) => {
 });
 
 app.get("/health", (_req: Request, res: Response) => {
-  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.1", mailbox: EMAIL_USER });
+  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.2", mailbox: EMAIL_USER });
 });
 
 // Diagnostic endpoint (bearer-protected): egress IP, DNS, raw TCP/TLS probe to IMAP/SMTP hosts.
@@ -558,5 +575,5 @@ process.on("unhandledRejection", (reason) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Email Hostinger MCP server v1.0.1 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
+  console.log(`Email Hostinger MCP server v1.0.2 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
 });
