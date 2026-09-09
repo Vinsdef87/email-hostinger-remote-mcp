@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
+import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { simpleParser } from "mailparser";
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -103,6 +104,37 @@ async function withImap<T>(fn: (client: ImapFlow) => Promise<T>): Promise<T> {
   } finally {
     try { await client.logout(); } catch { try { client.close(); } catch { /* ignore */ } }
   }
+}
+
+const ATTACHMENT_MAX_BYTES = parseInt(process.env.ATTACHMENT_MAX_BYTES || String(8 * 1024 * 1024), 10);
+const SEND_ATTACHMENTS_MAX_BYTES = parseInt(process.env.SEND_ATTACHMENTS_MAX_BYTES || String(15 * 1024 * 1024), 10);
+
+// Outgoing attachments: { filename, contentType?, contentBase64? | url? }
+const attachmentInputSchema = z.object({
+  filename: z.string().describe("File name as it will appear in the email"),
+  contentType: z.string().optional().describe("MIME type (auto-detected from filename if omitted)"),
+  contentBase64: z.string().optional().describe("File content, base64-encoded"),
+  url: z.string().url().optional().describe("Public URL to fetch the file from (alternative to contentBase64)"),
+});
+type AttachmentInput = z.infer<typeof attachmentInputSchema>;
+
+async function resolveOutgoingAttachments(list?: AttachmentInput[]): Promise<{ filename: string; content: Buffer; contentType?: string }[]> {
+  if (!list || list.length === 0) return [];
+  const out: { filename: string; content: Buffer; contentType?: string }[] = [];
+  let total = 0;
+  for (const a of list) {
+    let content: Buffer;
+    if (a.contentBase64) content = Buffer.from(a.contentBase64, "base64");
+    else if (a.url) {
+      const r = await fetch(a.url, { signal: AbortSignal.timeout(30000) });
+      if (!r.ok) throw new Error(`Failed to fetch attachment ${a.filename} from URL: HTTP ${r.status}`);
+      content = Buffer.from(await r.arrayBuffer());
+    } else throw new Error(`Attachment ${a.filename}: provide contentBase64 or url`);
+    total += content.length;
+    if (total > SEND_ATTACHMENTS_MAX_BYTES) throw new Error(`Total attachment size exceeds ${Math.round(SEND_ATTACHMENTS_MAX_BYTES / 1024 / 1024)} MB limit`);
+    out.push({ filename: a.filename, content, contentType: a.contentType });
+  }
+  return out;
 }
 
 // ── SMTP transporter (reused across requests) ────────────────────────────────
@@ -266,17 +298,70 @@ function createServer(): McpServer {
             text: parsed.text ?? "",
             html: parsed.html || null,
           },
-          attachments: (parsed.attachments || []).map((a: any) => ({
+          attachments: (parsed.attachments || []).map((a: any, i: number) => ({
+            index: i,
             filename: a.filename,
             contentType: a.contentType,
             size: a.size,
             contentId: a.contentId,
+            hint: "use email_get_attachment with this index (or filename) to download the content",
           })),
           headers: {
             messageId: parsed.messageId,
             inReplyTo: parsed.inReplyTo,
             references: parsed.references,
           },
+        };
+      } finally {
+        lock.release();
+      }
+    });
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  });
+
+  // ── GET ATTACHMENT ───────────────────────────────────────────────────────────
+  server.registerTool("email_get_attachment", {
+    title: "Download Attachment",
+    description: "Download one attachment of an email (by index from email_get_message, or by filename). Returns filename, contentType, size and the file content as base64. Max 8 MB per attachment.",
+    inputSchema: {
+      messageId: z.string().describe("Email UID returned by email_list_messages"),
+      folder: z.string().optional().default("inbox").describe("Folder where the message lives"),
+      index: z.number().int().min(0).optional().describe("Attachment index as returned by email_get_message (0-based)"),
+      filename: z.string().optional().describe("Attachment filename (case-insensitive). Alternative to index."),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false }
+  }, async ({ messageId, folder, index, filename }) => {
+    const data = await withImap(async (client) => {
+      const mailbox = await resolveFolder(client, folder ?? "inbox");
+      const lock = await client.getMailboxLock(mailbox);
+      try {
+        const d = await client.download(messageId, undefined, { uid: true });
+        if (!d || !d.content) return { error: "Message not found" };
+        const chunks: Buffer[] = [];
+        for await (const c of d.content) chunks.push(c as Buffer);
+        const parsed = await simpleParser(Buffer.concat(chunks));
+        const list: any[] = parsed.attachments || [];
+        if (list.length === 0) return { error: "This message has no attachments" };
+        let att: any | undefined;
+        if (typeof index === "number") att = list[index];
+        else if (filename) att = list.find((a) => (a.filename || "").toLowerCase() === filename.toLowerCase());
+        else if (list.length === 1) att = list[0];
+        if (!att) {
+          return {
+            error: "Attachment not found",
+            available: list.map((a, i) => ({ index: i, filename: a.filename, contentType: a.contentType, size: a.size })),
+          };
+        }
+        const buf: Buffer = att.content;
+        if (buf.length > ATTACHMENT_MAX_BYTES) {
+          return { error: `Attachment too large (${buf.length} bytes, max ${ATTACHMENT_MAX_BYTES})`, filename: att.filename, size: buf.length };
+        }
+        return {
+          messageId,
+          filename: att.filename || `attachment-${index ?? 0}`,
+          contentType: att.contentType,
+          size: buf.length,
+          contentBase64: buf.toString("base64"),
         };
       } finally {
         lock.release();
@@ -296,33 +381,27 @@ function createServer(): McpServer {
       isHtml: z.boolean().optional().default(false).describe("Set true if body is HTML"),
       cc: z.string().optional().describe("CC email address(es), comma-separated"),
       bcc: z.string().optional().describe("BCC email address(es), comma-separated"),
+      attachments: z.array(attachmentInputSchema).optional().describe("Optional file attachments (base64 or public URL). Max 15 MB total."),
     },
     annotations: { readOnlyHint: false, destructiveHint: false }
-  }, async ({ to, subject, body, isHtml, cc, bcc }) => {
-    const info = await smtpTransporter.sendMail({
+  }, async ({ to, subject, body, isHtml, cc, bcc, attachments }) => {
+    const files = await resolveOutgoingAttachments(attachments);
+    const mail: any = {
       from: FROM_NAME ? `"${FROM_NAME}" <${EMAIL_USER}>` : EMAIL_USER,
       to,
       cc,
       bcc,
       subject,
       [isHtml ? "html" : "text"]: body,
-    });
+      attachments: files.length ? files : undefined,
+    };
+    const info = await smtpTransporter.sendMail(mail);
     // Append to Sent folder (SMTP doesn't do this automatically)
     try {
       await withImap(async (client) => {
         const sentFolder = await resolveFolder(client, "sent");
-        const raw = [
-          `From: ${FROM_NAME ? `"${FROM_NAME}" <${EMAIL_USER}>` : EMAIL_USER}`,
-          `To: ${to}`,
-          cc ? `Cc: ${cc}` : "",
-          `Subject: ${subject}`,
-          `Date: ${new Date().toUTCString()}`,
-          `Message-ID: ${info.messageId}`,
-          `MIME-Version: 1.0`,
-          `Content-Type: ${isHtml ? "text/html" : "text/plain"}; charset=utf-8`,
-          ``,
-          body,
-        ].filter(Boolean).join("\r\n");
+        const composer = new MailComposer({ ...mail, messageId: info.messageId, date: new Date() });
+        const raw: Buffer = await composer.compile().build();
         await client.append(sentFolder, raw, ["\\Seen"]);
       });
     } catch (err) {
@@ -342,9 +421,11 @@ function createServer(): McpServer {
       isHtml: z.boolean().optional().default(false).describe("Set true if body is HTML"),
       replyAll: z.boolean().optional().default(false).describe("Reply to all recipients (To + Cc)"),
       folder: z.string().optional().default("inbox").describe("Folder where the original message lives"),
+      attachments: z.array(attachmentInputSchema).optional().describe("Optional file attachments (base64 or public URL). Max 15 MB total."),
     },
     annotations: { readOnlyHint: false, destructiveHint: false }
-  }, async ({ messageId, body, isHtml, replyAll, folder }) => {
+  }, async ({ messageId, body, isHtml, replyAll, folder, attachments }) => {
+    const files = await resolveOutgoingAttachments(attachments);
     // Fetch original for headers
     const original = await withImap(async (client) => {
       const mailbox = await resolveFolder(client, folder ?? "inbox");
@@ -385,6 +466,7 @@ function createServer(): McpServer {
       inReplyTo,
       references,
       [isHtml ? "html" : "text"]: body,
+      attachments: files.length ? files : undefined,
     });
 
     // Mark original as answered
@@ -400,7 +482,7 @@ function createServer(): McpServer {
       });
     } catch { /* non-fatal */ }
 
-    return { content: [{ type: "text", text: JSON.stringify({ success: true, messageId: info.messageId, to: toAddresses, cc: ccAddresses, subject }, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ success: true, messageId: info.messageId, to: toAddresses, cc: ccAddresses, subject, attachments: files.map((f) => f.filename) }, null, 2) }] };
   });
 
   // ── MARK AS READ ─────────────────────────────────────────────────────────────
@@ -505,7 +587,7 @@ function createServer(): McpServer {
 
 // ── Express app ──────────────────────────────────────────────────────────────
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 app.use((req: Request, res: Response, next) => {
   if (req.path === "/health") return next();
@@ -520,7 +602,7 @@ app.use((req: Request, res: Response, next) => {
 });
 
 app.get("/health", (_req: Request, res: Response) => {
-  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.4", mailbox: EMAIL_USER });
+  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.1.0", mailbox: EMAIL_USER });
 });
 
 // Diagnostic endpoint (bearer-protected): egress IP, DNS, raw TCP/TLS probe to IMAP/SMTP hosts.
@@ -628,5 +710,5 @@ process.on("unhandledRejection", (reason) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Email Hostinger MCP server v1.0.4 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
+  console.log(`Email Hostinger MCP server v1.1.0 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
 });
