@@ -44,14 +44,27 @@ const FOLDER_ALIASES: Record<string, string[]> = {
 };
 
 // ── IMAP connection helper ───────────────────────────────────────────────────
+const IMAP_CONNECTION_TIMEOUT = parseInt(process.env.IMAP_CONNECTION_TIMEOUT || "15000", 10);
+const IMAP_GREETING_TIMEOUT = parseInt(process.env.IMAP_GREETING_TIMEOUT || "15000", 10);
+const IMAP_SOCKET_TIMEOUT = parseInt(process.env.IMAP_SOCKET_TIMEOUT || "60000", 10);
+
 function newImapClient(): ImapFlow {
-  return new ImapFlow({
+  const client = new ImapFlow({
     host: IMAP_HOST,
     port: IMAP_PORT,
     secure: IMAP_SECURE,
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
     logger: false,
+    connectionTimeout: IMAP_CONNECTION_TIMEOUT,
+    greetingTimeout: IMAP_GREETING_TIMEOUT,
+    socketTimeout: IMAP_SOCKET_TIMEOUT,
   });
+  // ImapFlow emits 'error' on socket problems (ECONNRESET, ETIMEOUT...).
+  // Without a listener Node treats it as uncaught and kills the process.
+  client.on("error", (err: Error) => {
+    console.error("[imap] connection error:", (err as any)?.code || "", err?.message || err);
+  });
+  return client;
 }
 
 async function resolveFolder(client: ImapFlow, requested: string): Promise<string> {
@@ -74,11 +87,19 @@ async function resolveFolder(client: ImapFlow, requested: string): Promise<strin
 
 async function withImap<T>(fn: (client: ImapFlow) => Promise<T>): Promise<T> {
   const client = newImapClient();
-  await client.connect();
+  try {
+    await client.connect();
+  } catch (err) {
+    const e = err as any;
+    try { client.close(); } catch { /* ignore */ }
+    throw new Error(
+      `IMAP connect to ${IMAP_HOST}:${IMAP_PORT} failed (${e?.code || e?.responseText || "unknown"}): ${e?.message || e}`
+    );
+  }
   try {
     return await fn(client);
   } finally {
-    try { await client.logout(); } catch { /* ignore */ }
+    try { await client.logout(); } catch { try { client.close(); } catch { /* ignore */ } }
   }
 }
 
@@ -469,7 +490,7 @@ app.use((req: Request, res: Response, next) => {
 });
 
 app.get("/health", (_req: Request, res: Response) => {
-  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.0", mailbox: EMAIL_USER });
+  res.json({ status: "ok", service: "email-hostinger-mcp-server", version: "1.0.1", mailbox: EMAIL_USER });
 });
 
 app.all("/mcp", async (req: Request, res: Response) => {
@@ -484,7 +505,15 @@ app.all("/mcp", async (req: Request, res: Response) => {
   }
 });
 
+// Safety net: never let a stray socket error take the whole server down.
+process.on("uncaughtException", (err) => {
+  console.error("[process] uncaughtException:", (err as any)?.code || "", err?.message || err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[process] unhandledRejection:", (reason as any)?.message || reason);
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Email Hostinger MCP server v1.0.0 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
+  console.log(`Email Hostinger MCP server v1.0.1 running on port ${PORT} (mailbox: ${EMAIL_USER})`);
 });
